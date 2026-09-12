@@ -15,6 +15,23 @@ enum AssetSize {
     }
 }
 
+struct MonthBucket: Identifiable {
+    let key: MonthKey
+    let total: Int
+    let remaining: Int
+
+    var id: String { key.id }
+    var isFinished: Bool { remaining == 0 }
+}
+
+struct YearGroup: Identifiable {
+    let year: Int
+    let buckets: [MonthBucket]
+
+    var id: Int { year }
+    var label: String { year == 0 ? "Undated" : String(year) }
+}
+
 @MainActor
 @Observable
 final class PhotoDeck {
@@ -36,10 +53,16 @@ final class PhotoDeck {
     private(set) var pending: [PHAsset] = []
     private(set) var pendingBytes: Int64 = 0
     private(set) var libraryCount: Int = 0
+    private(set) var unreviewedTotal: Int = 0
     private(set) var isLimitedAccess = false
     private(set) var isLoading = false
     private(set) var sortOrder: SortOrder = .newest
+    private(set) var scope: Scope = .all
+    private(set) var months: [MonthBucket] = []
 
+    /// The whole library, kept in memory so changing month or scope is a filter
+    /// rather than a refetch.
+    private var allAssets: [PHAsset] = []
     private var state = ReviewState()
     private var history: [Move] = []
     private var saveTask: Task<Void, Never>?
@@ -57,6 +80,17 @@ final class PhotoDeck {
     var remaining: Int { max(0, queue.count - cursor) }
     var canUndo: Bool { !history.isEmpty }
     var sessionProgress: Double { queue.isEmpty ? 1 : Double(cursor) / Double(queue.count) }
+    var isScoped: Bool { scope != .all }
+
+    var monthsByYear: [YearGroup] {
+        var order: [Int] = []
+        var grouped: [Int: [MonthBucket]] = [:]
+        for bucket in months {
+            if grouped[bucket.key.year] == nil { order.append(bucket.key.year) }
+            grouped[bucket.key.year, default: []].append(bucket)
+        }
+        return order.map { YearGroup(year: $0, buckets: grouped[$0] ?? []) }
+    }
 
     func window(ahead count: Int) -> [PHAsset] {
         guard cursor < queue.count else { return [] }
@@ -69,6 +103,7 @@ final class PhotoDeck {
         guard phase == .loading, !isLoading else { return }
         state = ReviewState.load()
         sortOrder = state.sort
+        scope = state.scope
 
         let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
         guard status == .authorized || status == .limited else {
@@ -94,15 +129,12 @@ final class PhotoDeck {
         state.reviewed.formIntersection(liveIDs)
         state.pending.formIntersection(liveIDs)
 
+        allAssets = all
         libraryCount = all.count
         pending = all.filter { state.pending.contains($0.localIdentifier) }
-        queue = all.filter { !state.reviewed.contains($0.localIdentifier) }
 
-        // The rebuilt queue holds only unreviewed photos, so every position from
-        // the old queue is meaningless — start at the top and drop the undo stack.
-        cursor = 0
-        history.removeAll()
-
+        rebuildQueue()
+        recomputeMonths()
         saveNow()
         recomputePendingBytes()
     }
@@ -117,6 +149,68 @@ final class PhotoDeck {
         assets.reserveCapacity(result.count)
         result.enumerateObjects { asset, _, _ in assets.append(asset) }
         return order == .shuffled ? assets.shuffled() : assets
+    }
+
+    /// The queue is always "unreviewed photos inside the current scope". Any
+    /// position from a previous queue is meaningless, so start at the top and
+    /// drop the undo stack.
+    private func rebuildQueue() {
+        queue = allAssets.filter { asset in
+            !state.reviewed.contains(asset.localIdentifier) && matchesScope(asset)
+        }
+        cursor = 0
+        history.removeAll()
+    }
+
+    private func matchesScope(_ asset: PHAsset) -> Bool {
+        switch scope {
+        case .all:
+            return true
+        case .month(let key):
+            return MonthKey(for: asset.creationDate) == key
+        }
+    }
+
+    // MARK: - Months
+
+    private func recomputeMonths() {
+        var totals: [MonthKey: (total: Int, remaining: Int)] = [:]
+        var unreviewed = 0
+
+        for asset in allAssets {
+            let key = MonthKey(for: asset.creationDate)
+            var entry = totals[key] ?? (total: 0, remaining: 0)
+            entry.total += 1
+            if !state.reviewed.contains(asset.localIdentifier) {
+                entry.remaining += 1
+                unreviewed += 1
+            }
+            totals[key] = entry
+        }
+
+        unreviewedTotal = unreviewed
+        months = totals
+            .map { MonthBucket(key: $0.key, total: $0.value.total, remaining: $0.value.remaining) }
+            .sorted { a, b in
+                // Undated last, then newest month first.
+                if a.key.isUndated != b.key.isUndated { return b.key.isUndated }
+                if a.key.year != b.key.year { return a.key.year > b.key.year }
+                return a.key.month > b.key.month
+            }
+    }
+
+    /// Counts drift as you swipe; the month sheet calls this when it opens.
+    func refreshMonths() {
+        recomputeMonths()
+    }
+
+    func setScope(_ newScope: Scope) {
+        guard newScope != scope else { return }
+        scope = newScope
+        state.scope = newScope
+        rebuildQueue()
+        recomputeMonths()
+        saveNow()
     }
 
     // MARK: - Swiping
@@ -138,6 +232,7 @@ final class PhotoDeck {
         if history.count > 200 { history.removeFirst() }
 
         cursor += 1
+        unreviewedTotal = max(0, unreviewedTotal - 1)
         scheduleSave()
     }
 
@@ -151,10 +246,11 @@ final class PhotoDeck {
             recomputePendingBytes()
         }
         cursor = max(0, cursor - 1)
+        unreviewedTotal += 1
         scheduleSave()
     }
 
-    /// Pull a photo back out of the trash pile; it stays reviewed, just kept.
+    /// Pull a photo back out of the bin; it stays reviewed, just kept.
     func restore(_ asset: PHAsset) {
         state.pending.remove(asset.localIdentifier)
         pending.removeAll { $0.localIdentifier == asset.localIdentifier }
@@ -183,24 +279,33 @@ final class PhotoDeck {
             PHAssetChangeRequest.deleteAssets(targets as NSArray)
         }
 
-        for asset in targets {
-            state.pending.remove(asset.localIdentifier)
-        }
+        let goneIDs = Set(targets.map(\.localIdentifier))
+        state.pending.subtract(goneIDs)
+        state.reviewed.subtract(goneIDs)
+        allAssets.removeAll { goneIDs.contains($0.localIdentifier) }
         pending.removeAll()
         pendingBytes = 0
+        libraryCount = allAssets.count
+
+        // Deleted assets are still sitting behind the cursor in `queue`; undoing
+        // back onto one would show a photo that no longer exists.
         history.removeAll()
-        libraryCount = max(0, libraryCount - targets.count)
+        recomputeMonths()
         saveNow()
     }
 
+    /// Clears progress for whatever is currently in scope — the month you're
+    /// looking at, or the whole library when nothing is scoped.
     func resetProgress() async {
-        state.reviewed.removeAll()
-        state.pending.removeAll()
-        pending.removeAll()
-        pendingBytes = 0
-        history.removeAll()
+        let targetIDs = Set(allAssets.filter { matchesScope($0) }.map(\.localIdentifier))
+        state.reviewed.subtract(targetIDs)
+        state.pending.subtract(targetIDs)
+        pending.removeAll { targetIDs.contains($0.localIdentifier) }
+
+        rebuildQueue()
+        recomputeMonths()
+        recomputePendingBytes()
         saveNow()
-        await reload()
     }
 
     // MARK: - Persistence

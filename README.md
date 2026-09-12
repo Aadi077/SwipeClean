@@ -12,6 +12,12 @@ then everything lands in **Recently Deleted** for 30 days.
   originals on demand, and deletions sync back to iCloud automatically.
 - Remembers every photo you've judged, so closing the app and coming back later
   picks up exactly where you left off (`review-state.json` in Application Support).
+- **Browse by month.** The calendar button lists every month that has photos,
+  grouped by year and newest first, each with how many you've still to review
+  ("12 left of 40") and a progress bar. Pick one and the deck serves only that
+  month, which makes a huge library tractable — do one month per sitting. The
+  chosen month is remembered across launches, and "Start over" applies to just
+  that month while you're in it. Photos with no date land in an "Undated" group.
 - Photos you swipe left on pile up in a bin. You can review that grid and tap
   any photo to put it back before committing.
 - Deleting is **batched** on purpose: one system confirmation for the whole pile
@@ -26,6 +32,7 @@ then everything lands in **Recently Deleted** for 30 days.
 | Undo last swipe | Tap the arrow between the buttons |
 | See the whole photo (uncropped) | Tap the card |
 | Review the bin / delete for real | Tap the red pill at the top right |
+| Browse by month | Tap the calendar icon at the top |
 | Sort order, rescan, start over | Tap the `⋯` menu |
 
 ## Getting it onto your phone
