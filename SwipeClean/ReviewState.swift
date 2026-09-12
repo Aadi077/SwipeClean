@@ -84,6 +84,7 @@ struct ReviewState: Codable {
     var pending: Set<String> = []
     var sort: SortOrder = .newest
     var scope: Scope = .all
+    var allowsCellular = false
 
     init() {}
 
@@ -95,6 +96,7 @@ struct ReviewState: Codable {
         pending = try box.decodeIfPresent(Set<String>.self, forKey: .pending) ?? []
         sort = try box.decodeIfPresent(SortOrder.self, forKey: .sort) ?? .newest
         scope = try box.decodeIfPresent(Scope.self, forKey: .scope) ?? .all
+        allowsCellular = try box.decodeIfPresent(Bool.self, forKey: .allowsCellular) ?? false
     }
 
     private static var fileURL: URL {

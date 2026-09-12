@@ -29,6 +29,9 @@ struct PhotoCardView: View {
     @Environment(\.displayScale) private var displayScale
     @State private var image: UIImage?
     @State private var sizeText: String?
+    @State private var needsNetwork = false
+    @State private var downloadProgress: Double?
+    @State private var forceDownload = false
 
     var body: some View {
         GeometryReader { geo in
@@ -41,6 +44,10 @@ struct PhotoCardView: View {
                         .aspectRatio(contentMode: fit ? .fit : .fill)
                         .frame(width: geo.size.width, height: geo.size.height)
                         .clipped()
+                } else if needsNetwork {
+                    waitingForWiFi
+                } else if let downloadProgress {
+                    downloadRing(downloadProgress)
                 } else {
                     ProgressView().tint(.white.opacity(0.35))
                 }
@@ -49,16 +56,69 @@ struct PhotoCardView: View {
             }
             .frame(width: geo.size.width, height: geo.size.height)
             .animation(.easeOut(duration: 0.18), value: image)
-            .task(id: asset.localIdentifier) {
+            .task(id: "\(asset.localIdentifier)|\(forceDownload)") {
                 let pixels = CGSize(width: geo.size.width * displayScale,
                                     height: geo.size.height * displayScale)
-                image = await ImageStore.shared.image(for: asset, size: pixels)
+                needsNetwork = false
+                downloadProgress = nil
+
+                let outcome = await ImageStore.shared.load(
+                    for: asset,
+                    size: pixels,
+                    force: forceDownload,
+                    onProgress: { value in
+                        Task { @MainActor in downloadProgress = value }
+                    }
+                )
+
+                downloadProgress = nil
+                switch outcome {
+                case .image(let loaded): image = loaded
+                case .needsNetwork: needsNetwork = true
+                case .failed: image = nil
+                }
             }
             .task(id: asset.localIdentifier) {
                 let bytes = await ImageStore.shared.byteSize(of: asset)
                 sizeText = bytes > 0 ? Fmt.bytes(bytes) : nil
             }
         }
+    }
+
+    /// Shown when the original lives in iCloud and we're on a metered connection.
+    private var waitingForWiFi: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "icloud.and.arrow.down")
+                .font(.system(size: 38))
+                .foregroundStyle(.secondary)
+            Text("Waiting for Wi-Fi")
+                .font(.headline)
+            Text("This one is only in iCloud. Downloading it now would use cellular data.")
+                .font(.caption)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 28)
+            Button("Download anyway") { forceDownload = true }
+                .buttonStyle(.borderedProminent)
+                .tint(Color.keepGreen)
+                .padding(.top, 2)
+        }
+    }
+
+    private func downloadRing(_ value: Double) -> some View {
+        ZStack {
+            Circle()
+                .stroke(.white.opacity(0.2), lineWidth: 4)
+            Circle()
+                .trim(from: 0, to: max(0.02, value))
+                .stroke(Color.keepGreen, style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+            Text("\(Int(value * 100))%")
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundStyle(.secondary)
+        }
+        .frame(width: 58, height: 58)
+        .animation(.easeOut(duration: 0.2), value: value)
     }
 
     private var caption: some View {

@@ -111,6 +111,12 @@ struct DeckScreen: View {
                 Label(fitMode ? "Fill the card" : "Fit the whole photo",
                       systemImage: fitMode ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
             }
+            Toggle(isOn: Binding(
+                get: { deck.allowsCellular },
+                set: { deck.setAllowsCellular($0) }
+            )) {
+                Label("Use cellular data", systemImage: "antenna.radiowaves.left.and.right")
+            }
             Divider()
             Button { showMonths = true } label: {
                 Label("Browse by month", systemImage: "calendar")

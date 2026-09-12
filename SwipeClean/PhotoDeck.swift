@@ -57,6 +57,7 @@ final class PhotoDeck {
     private(set) var isLimitedAccess = false
     private(set) var isLoading = false
     private(set) var sortOrder: SortOrder = .newest
+    private(set) var allowsCellular = false
     private(set) var scope: Scope = .all
     private(set) var months: [MonthBucket] = []
 
@@ -104,6 +105,8 @@ final class PhotoDeck {
         state = ReviewState.load()
         sortOrder = state.sort
         scope = state.scope
+        allowsCellular = state.allowsCellular
+        ImageStore.shared.allowsCellular = allowsCellular
 
         let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
         guard status == .authorized || status == .limited else {
@@ -257,6 +260,14 @@ final class PhotoDeck {
         history.removeAll { $0.asset.localIdentifier == asset.localIdentifier }
         recomputePendingBytes()
         scheduleSave()
+    }
+
+    func setAllowsCellular(_ allowed: Bool) {
+        guard allowed != allowsCellular else { return }
+        allowsCellular = allowed
+        state.allowsCellular = allowed
+        ImageStore.shared.allowsCellular = allowed
+        saveNow()
     }
 
     func setSort(_ order: SortOrder) {
