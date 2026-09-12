@@ -14,6 +14,7 @@ struct DeckScreen: View {
     @State private var fitMode = false
     @State private var videoPaused = false
     @State private var showSummary = false
+    @State private var showDuplicates = false
     @State private var cardPixels = CGSize(width: 900, height: 1400)
 
     private let threshold: CGFloat = 110
@@ -26,6 +27,7 @@ struct DeckScreen: View {
         }
         .sheet(isPresented: $showTrash) { TrashView() }
         .sheet(isPresented: $showFilters) { FilterPickerView() }
+        .sheet(isPresented: $showDuplicates) { DuplicatesView() }
         .sheet(isPresented: $showSummary) {
             SummaryView(justFreed: nil) { showSummary = false }
         }
@@ -133,6 +135,9 @@ struct DeckScreen: View {
             Divider()
             Button { showFilters = true } label: {
                 Label("Filter photos", systemImage: "line.3.horizontal.decrease.circle")
+            }
+            Button { showDuplicates = true } label: {
+                Label("Find duplicates", systemImage: "square.on.square")
             }
             Button { showSummary = true } label: {
                 Label("Your progress", systemImage: "chart.bar")

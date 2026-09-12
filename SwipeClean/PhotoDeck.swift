@@ -88,6 +88,10 @@ final class PhotoDeck {
     private(set) var sessionFreed: Int64 = 0
     /// Set when a delete lands, so the bin sheet can turn into a receipt.
     private(set) var lastFreed: Int64?
+    private(set) var duplicateGroups: [DuplicateGroup] = []
+    private(set) var duplicateProgress: (done: Int, total: Int)?
+    private(set) var hasScannedDuplicates = false
+    private(set) var duplicateScanFailed = false
     private(set) var isLimitedAccess = false
     private(set) var isLoading = false
     private(set) var sortOrder: SortOrder = .newest
@@ -109,6 +113,7 @@ final class PhotoDeck {
     private var history: [Move] = []
     private var saveTask: Task<Void, Never>?
     private var sizingTask: Task<Void, Never>?
+    private var duplicateTask: Task<Void, Never>?
 
     // MARK: - Derived
 
@@ -529,6 +534,82 @@ final class PhotoDeck {
 
     /// Pull a photo back out of the bin; it stays reviewed, just kept.
     func acknowledgeFreed() { lastFreed = nil }
+
+    func asset(for id: String) -> PHAsset? { assetsByID[id] }
+
+    func byteSize(for id: String) -> Int64 { SizeIndex.shared.size(for: id) ?? 0 }
+
+    // MARK: - Duplicates
+
+    func scanForDuplicates() {
+        guard duplicateTask == nil else { return }
+        let candidates = allAssets.filter { !state.reviewed.contains($0.localIdentifier) }
+        duplicateProgress = (done: 0, total: max(1, candidates.count))
+
+        duplicateTask = Task { [weak self] in
+            // An immutable local: the progress callback runs on other threads,
+            // and reaching back through the captured `weak var self` from there
+            // is a data race.
+            let deck = self
+
+            let found = await DuplicateFinder.shared.findGroups(in: candidates) { done, total in
+                Task { @MainActor in
+                    deck?.duplicateProgress = (done: done, total: total)
+                }
+            }
+
+            await MainActor.run {
+                deck?.duplicateGroups = found.groups
+                deck?.duplicateScanFailed = found.didFail
+                deck?.duplicateProgress = nil
+                deck?.duplicateTask = nil
+                deck?.hasScannedDuplicates = true
+            }
+        }
+    }
+
+    func cancelDuplicateScan() {
+        duplicateTask?.cancel()
+        duplicateTask = nil
+        duplicateProgress = nil
+    }
+
+    /// Sends a batch straight to the bin. Nothing is deleted here — it still
+    /// goes through the same confirm-and-batch path as a swipe.
+    func markForDeletion(_ ids: [String]) {
+        let fresh = ids.filter { !state.pending.contains($0) }
+        guard !fresh.isEmpty else { return }
+
+        for id in fresh {
+            state.reviewed.insert(id)
+            state.skipped.remove(id)
+            state.pending.insert(id)
+            if let asset = assetsByID[id] { pending.append(asset) }
+        }
+
+        // Drop them from what's still coming, keeping the cursor valid.
+        let removing = Set(fresh)
+        if cursor < queue.count {
+            let head = Array(queue[..<cursor])
+            let tail = Array(queue[cursor...]).filter { !removing.contains($0.localIdentifier) }
+            queue = head + tail
+        }
+
+        // A bulk edit invalidates the positional undo stack.
+        history.removeAll()
+        sessionReviewed += fresh.count
+        sessionBinned += fresh.count
+        state.lifetimeReviewed += fresh.count
+
+        duplicateGroups = duplicateGroups.compactMap { group in
+            let kept = group.memberIDs.filter { !removing.contains($0) }
+            return kept.count > 1 ? DuplicateGroup(id: group.id, memberIDs: kept) : nil
+        }
+
+        recomputeBuckets()
+        recomputePendingBytes()
+        saveNow()
+    }
 
     func toggleSkippedOnly() {
         var next = filter
