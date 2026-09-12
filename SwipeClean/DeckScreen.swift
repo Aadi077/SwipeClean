@@ -12,6 +12,7 @@ struct DeckScreen: View {
     @State private var showTrash = false
     @State private var showFilters = false
     @State private var fitMode = false
+    @State private var videoPaused = false
     @State private var cardPixels = CGSize(width: 900, height: 1400)
 
     private let threshold: CGFloat = 110
@@ -167,12 +168,20 @@ struct DeckScreen: View {
                             .allowsHitTesting(false)
                     }
 
-                    CardFrame(asset: current, size: size, fit: fitMode)
+                    CardFrame(asset: current, size: size, fit: fitMode, paused: videoPaused)
                         .overlay { stamps }
                         .offset(offset)
                         .rotationEffect(.degrees(Double(offset.width) / 20), anchor: .bottom)
                         .gesture(drag)
-                        .onTapGesture { withAnimation(.snappy) { fitMode.toggle() } }
+                        .onTapGesture {
+                            // Tap means different things by type: pause a video,
+                            // reframe a photo.
+                            if current.mediaType == .video {
+                                videoPaused.toggle()
+                            } else {
+                                withAnimation(.snappy) { fitMode.toggle() }
+                            }
+                        }
                         .id(current.localIdentifier)
                 } else {
                     DoneCard(showTrash: $showTrash, showFilters: $showFilters)
@@ -184,7 +193,10 @@ struct DeckScreen: View {
                 cardPixels = CGSize(width: size.width * displayScale, height: size.height * displayScale)
                 prefetch()
             }
-            .onChange(of: deck.cursor) { prefetch() }
+            .onChange(of: deck.cursor) {
+                prefetch()
+                videoPaused = false
+            }
         }
     }
 

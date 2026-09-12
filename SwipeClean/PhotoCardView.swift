@@ -1,3 +1,4 @@
+import AVFoundation
 import Photos
 import SwiftUI
 
@@ -8,9 +9,10 @@ struct CardFrame: View {
     let asset: PHAsset
     let size: CGSize
     let fit: Bool
+    var paused: Bool = false
 
     var body: some View {
-        PhotoCardView(asset: asset, fit: fit)
+        PhotoCardView(asset: asset, fit: fit, paused: paused)
             .frame(width: size.width, height: size.height)
             .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
             .overlay {
@@ -25,6 +27,7 @@ struct CardFrame: View {
 struct PhotoCardView: View {
     let asset: PHAsset
     let fit: Bool
+    var paused: Bool = false
 
     @Environment(\.displayScale) private var displayScale
     @State private var image: UIImage?
@@ -32,6 +35,9 @@ struct PhotoCardView: View {
     @State private var needsNetwork = false
     @State private var downloadProgress: Double?
     @State private var forceDownload = false
+    @State private var player: AVPlayer?
+
+    private var isVideo: Bool { asset.mediaType == .video }
 
     var body: some View {
         GeometryReader { geo in
@@ -52,10 +58,46 @@ struct PhotoCardView: View {
                     ProgressView().tint(.white.opacity(0.35))
                 }
 
+                if isVideo, let player {
+                    PlayerLayerView(player: player, fill: !fit)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .allowsHitTesting(false)
+                }
+
+                if isVideo && paused {
+                    Image(systemName: "play.circle.fill")
+                        .font(.system(size: 60))
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, .black.opacity(0.35))
+                        .allowsHitTesting(false)
+                }
+
                 caption.frame(maxHeight: .infinity, alignment: .bottom)
             }
             .frame(width: geo.size.width, height: geo.size.height)
             .animation(.easeOut(duration: 0.18), value: image)
+            .task(id: asset.localIdentifier) {
+                guard isVideo else { return }
+                guard let item = await ImageStore.shared.playerItem(for: asset) else { return }
+                let made = AVPlayer(playerItem: item)
+                made.isMuted = true                  // triage, not viewing
+                made.actionAtItemEnd = .none
+                player = made
+                if !paused { made.play() }
+            }
+            .onChange(of: paused) { _, isPaused in
+                isPaused ? player?.pause() : player?.play()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)) { note in
+                // Loop, so a two-second clip isn't a single blink.
+                guard let item = note.object as? AVPlayerItem, item === player?.currentItem else { return }
+                player?.seek(to: .zero)
+                if !paused { player?.play() }
+            }
+            .onDisappear {
+                player?.pause()
+                player = nil
+            }
             .task(id: "\(asset.localIdentifier)|\(forceDownload)") {
                 let pixels = CGSize(width: geo.size.width * displayScale,
                                     height: geo.size.height * displayScale)
