@@ -8,6 +8,7 @@ struct TrashView: View {
 
     @State private var isDeleting = false
     @State private var errorText: String?
+    @State private var freed: Int64?
 
     private let columns = [GridItem(.adaptive(minimum: 104), spacing: 4)]
 
@@ -16,7 +17,12 @@ struct TrashView: View {
             ZStack {
                 Color.appBackground.ignoresSafeArea()
 
-                if deck.pending.isEmpty {
+                if let freed {
+                    SummaryView(justFreed: freed) {
+                        deck.acknowledgeFreed()
+                        dismiss()
+                    }
+                } else if deck.pending.isEmpty {
                     ContentUnavailableView(
                         "Nothing marked",
                         systemImage: "trash",
@@ -49,11 +55,14 @@ struct TrashView: View {
                     .safeAreaInset(edge: .bottom) { deleteBar }
                 }
             }
-            .navigationTitle("Marked for deletion")
+            .navigationTitle(freed == nil ? "Marked for deletion" : "")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
+                    // The receipt has its own Done; two would sit side by side.
+                    if freed == nil {
+                        Button("Done") { dismiss() }
+                    }
                 }
             }
             .alert("Couldn't delete", isPresented: Binding(
@@ -108,7 +117,7 @@ struct TrashView: View {
         Task {
             do {
                 try await deck.emptyTrash()
-                dismiss()
+                freed = deck.lastFreed ?? 0
             } catch {
                 // Cancelling the system confirmation lands here too; stay put quietly.
                 let nsError = error as NSError

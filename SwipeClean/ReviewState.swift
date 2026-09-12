@@ -147,6 +147,8 @@ struct ReviewState: Codable {
     var sort: SortOrder = .newest
     var filter = Filter()
     var allowsCellular = false
+    var lifetimeReviewed = 0
+    var lifetimeFreed: Int64 = 0
 
     init() {}
 
@@ -159,6 +161,8 @@ struct ReviewState: Codable {
         skipped = try box.decodeIfPresent(Set<String>.self, forKey: .skipped) ?? []
         sort = try box.decodeIfPresent(SortOrder.self, forKey: .sort) ?? .newest
         allowsCellular = try box.decodeIfPresent(Bool.self, forKey: .allowsCellular) ?? false
+        lifetimeReviewed = try box.decodeIfPresent(Int.self, forKey: .lifetimeReviewed) ?? 0
+        lifetimeFreed = try box.decodeIfPresent(Int64.self, forKey: .lifetimeFreed) ?? 0
 
         // A shape mismatch here must never throw: load() turns any decode error
         // into a blank state, which would silently discard all review progress.
@@ -173,6 +177,7 @@ struct ReviewState: Codable {
 
     private enum CodingKeys: String, CodingKey {
         case reviewed, pending, skipped, sort, filter, allowsCellular
+        case lifetimeReviewed, lifetimeFreed
     }
 
     /// Read-only; `scope` was replaced by `filter`. Kept in its own key set so it

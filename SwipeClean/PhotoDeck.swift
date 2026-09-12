@@ -83,6 +83,11 @@ final class PhotoDeck {
     private(set) var skippedCount: Int = 0
     /// Non-nil while the background size measurement is running.
     private(set) var sizingProgress: (done: Int, total: Int)?
+    private(set) var sessionReviewed = 0
+    private(set) var sessionBinned = 0
+    private(set) var sessionFreed: Int64 = 0
+    /// Set when a delete lands, so the bin sheet can turn into a receipt.
+    private(set) var lastFreed: Int64?
     private(set) var isLimitedAccess = false
     private(set) var isLoading = false
     private(set) var sortOrder: SortOrder = .newest
@@ -119,6 +124,8 @@ final class PhotoDeck {
     var canUndo: Bool { !history.isEmpty }
     var sessionProgress: Double { queue.isEmpty ? 1 : Double(cursor) / Double(queue.count) }
     var isFiltered: Bool { !filter.isDefault }
+    var lifetimeReviewed: Int { state.lifetimeReviewed }
+    var lifetimeFreed: Int64 { state.lifetimeFreed }
 
     /// "Screenshots · Sept 2024", or nil when nothing is narrowed.
     var filterSummary: String? {
@@ -465,6 +472,10 @@ final class PhotoDeck {
             }
         }
 
+        sessionReviewed += 1
+        state.lifetimeReviewed += 1
+        if delete { sessionBinned += 1 }
+
         history.append(Move(asset: asset, verdict: delete ? .bin : .keep, wasSkipped: wasSkipped))
         if history.count > 200 { history.removeFirst() }
 
@@ -495,6 +506,9 @@ final class PhotoDeck {
 
         switch move.verdict {
         case .keep, .bin:
+            sessionReviewed = max(0, sessionReviewed - 1)
+            state.lifetimeReviewed = max(0, state.lifetimeReviewed - 1)
+            if move.verdict == .bin { sessionBinned = max(0, sessionBinned - 1) }
             state.reviewed.remove(id)
             if move.verdict == .bin {
                 state.pending.remove(id)
@@ -514,6 +528,8 @@ final class PhotoDeck {
     }
 
     /// Pull a photo back out of the bin; it stays reviewed, just kept.
+    func acknowledgeFreed() { lastFreed = nil }
+
     func toggleSkippedOnly() {
         var next = filter
         next.skippedOnly.toggle()
@@ -563,6 +579,11 @@ final class PhotoDeck {
         try await PHPhotoLibrary.shared().performChanges {
             PHAssetChangeRequest.deleteAssets(targets as NSArray)
         }
+
+        let freed = pendingBytes
+        sessionFreed += freed
+        state.lifetimeFreed += freed
+        lastFreed = freed
 
         let goneIDs = Set(targets.map(\.localIdentifier))
         state.pending.subtract(goneIDs)
