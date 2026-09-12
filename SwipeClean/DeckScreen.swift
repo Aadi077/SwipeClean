@@ -10,7 +10,7 @@ struct DeckScreen: View {
     @State private var offset: CGSize = .zero
     @State private var locked = false
     @State private var showTrash = false
-    @State private var showMonths = false
+    @State private var showFilters = false
     @State private var fitMode = false
     @State private var cardPixels = CGSize(width: 900, height: 1400)
 
@@ -23,7 +23,7 @@ struct DeckScreen: View {
             controls
         }
         .sheet(isPresented: $showTrash) { TrashView() }
-        .sheet(isPresented: $showMonths) { MonthPickerView() }
+        .sheet(isPresented: $showFilters) { FilterPickerView() }
     }
 
     // MARK: - Header
@@ -58,17 +58,15 @@ struct DeckScreen: View {
 
     private var subtitle: String {
         let noun = deck.remaining == 1 ? "photo" : "photos"
-        switch deck.scope {
-        case .all: return "\(noun) left"
-        case .month(let key): return "\(noun) left in \(key.title)"
-        }
+        guard let summary = deck.filterSummary else { return "\(noun) left" }
+        return "\(noun) left in \(summary)"
     }
 
     private var monthButton: some View {
-        Button { showMonths = true } label: {
-            Image(systemName: deck.isScoped ? "calendar.badge.checkmark" : "calendar")
-                .font(.system(size: 19, weight: .semibold))
-                .foregroundStyle(deck.isScoped ? Color.keepGreen : Color.secondary)
+        Button { showFilters = true } label: {
+            Image(systemName: deck.isFiltered ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+                .font(.system(size: 21, weight: .semibold))
+                .foregroundStyle(deck.isFiltered ? Color.keepGreen : Color.secondary)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 6)
         }
@@ -118,8 +116,8 @@ struct DeckScreen: View {
                 Label("Use cellular data", systemImage: "antenna.radiowaves.left.and.right")
             }
             Divider()
-            Button { showMonths = true } label: {
-                Label("Browse by month", systemImage: "calendar")
+            Button { showFilters = true } label: {
+                Label("Filter photos", systemImage: "line.3.horizontal.decrease.circle")
             }
             Button {
                 Task { await deck.reload() }
@@ -129,7 +127,7 @@ struct DeckScreen: View {
             Button(role: .destructive) {
                 Task { await deck.resetProgress() }
             } label: {
-                Label(deck.isScoped ? "Start over in \(deck.scope.title)" : "Start over",
+                Label(deck.filterSummary.map { "Start over in \($0)" } ?? "Start over",
                       systemImage: "arrow.counterclockwise")
             }
         } label: {
@@ -167,7 +165,7 @@ struct DeckScreen: View {
                         .onTapGesture { withAnimation(.snappy) { fitMode.toggle() } }
                         .id(current.localIdentifier)
                 } else {
-                    DoneCard(showTrash: $showTrash, showMonths: $showMonths)
+                    DoneCard(showTrash: $showTrash, showFilters: $showFilters)
                         .frame(width: size.width, height: size.height)
                 }
             }
@@ -295,7 +293,7 @@ struct DeckScreen: View {
 struct DoneCard: View {
     @Environment(PhotoDeck.self) private var deck
     @Binding var showTrash: Bool
-    @Binding var showMonths: Bool
+    @Binding var showFilters: Bool
 
     var body: some View {
         VStack(spacing: 14) {
@@ -315,13 +313,13 @@ struct DoneCard: View {
                     .buttonStyle(.borderedProminent)
                     .tint(Color.deleteRed)
             }
-            Button(deck.isScoped ? "Pick another month" : "Browse by month") {
-                showMonths = true
+            Button(deck.isFiltered ? "Change filter" : "Filter photos") {
+                showFilters = true
             }
             .buttonStyle(.bordered)
             .tint(.white)
 
-            Button(deck.isScoped ? "Start over in \(deck.scope.title)" : "Start over") {
+            Button(deck.filterSummary.map { "Start over in \($0)" } ?? "Start over") {
                 Task { await deck.resetProgress() }
             }
             .buttonStyle(.borderless)
@@ -337,11 +335,9 @@ struct DoneCard: View {
             let noun = deck.pending.count == 1 ? "item" : "items"
             return "\(deck.pending.count) \(noun) still waiting in the bin."
         }
-        switch deck.scope {
-        case .all:
+        guard let summary = deck.filterSummary else {
             return "You've been through every photo in your library."
-        case .month(let key):
-            return "You've been through every photo from \(key.title)."
         }
+        return "You've been through every photo in \(summary)."
     }
 }

@@ -64,17 +64,70 @@ struct MonthKey: Hashable, Codable, Identifiable {
     }
 }
 
-/// Which slice of the library the deck is serving up.
-enum Scope: Hashable, Codable {
+/// Kinds of photo you can single out. These map onto properties PhotoKit
+/// already hands us, so filtering stays an in-memory predicate.
+enum Category: String, Codable, CaseIterable, Identifiable {
     case all
-    case month(MonthKey)
+    case screenshots
+    case videos
+    case selfies
+    case livePhotos
+    case favorites
 
-    var title: String {
+    var id: String { rawValue }
+
+    var label: String {
         switch self {
-        case .all: return "your library"
-        case .month(let key): return key.title
+        case .all: return "Any type"
+        case .screenshots: return "Screenshots"
+        case .videos: return "Videos"
+        case .selfies: return "Selfies"
+        case .livePhotos: return "Live Photos"
+        case .favorites: return "Favorites"
         }
     }
+
+    var symbol: String {
+        switch self {
+        case .all: return "photo.on.rectangle"
+        case .screenshots: return "camera.viewfinder"
+        case .videos: return "video"
+        case .selfies: return "person.crop.square"
+        case .livePhotos: return "livephoto"
+        case .favorites: return "heart"
+        }
+    }
+}
+
+/// Which slice of the library the deck is serving up. Every non-default field
+/// narrows further — they AND together, so "Screenshots from Sept 2024" works.
+struct Filter: Hashable, Codable {
+    var category: Category = .all
+    var month: MonthKey? = nil
+    var albumID: String? = nil
+
+    var isDefault: Bool { self == Filter() }
+
+    init(category: Category = .all, month: MonthKey? = nil, albumID: String? = nil) {
+        self.category = category
+        self.month = month
+        self.albumID = albumID
+    }
+
+    // Lenient like ReviewState: a field added in a later version must not make
+    // an existing filter undecodable.
+    init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        category = (try? box.decodeIfPresent(Category.self, forKey: .category) ?? .all) ?? .all
+        month = try? box.decodeIfPresent(MonthKey.self, forKey: .month)
+        albumID = try? box.decodeIfPresent(String.self, forKey: .albumID)
+    }
+}
+
+/// Only still read, to carry a pre-filter state file forward.
+enum LegacyScope: Hashable, Codable {
+    case all
+    case month(MonthKey)
 }
 
 /// Everything that survives an app relaunch: which photos you've already judged,
@@ -83,7 +136,7 @@ struct ReviewState: Codable {
     var reviewed: Set<String> = []
     var pending: Set<String> = []
     var sort: SortOrder = .newest
-    var scope: Scope = .all
+    var filter = Filter()
     var allowsCellular = false
 
     init() {}
@@ -95,8 +148,28 @@ struct ReviewState: Codable {
         reviewed = try box.decodeIfPresent(Set<String>.self, forKey: .reviewed) ?? []
         pending = try box.decodeIfPresent(Set<String>.self, forKey: .pending) ?? []
         sort = try box.decodeIfPresent(SortOrder.self, forKey: .sort) ?? .newest
-        scope = try box.decodeIfPresent(Scope.self, forKey: .scope) ?? .all
         allowsCellular = try box.decodeIfPresent(Bool.self, forKey: .allowsCellular) ?? false
+
+        // A shape mismatch here must never throw: load() turns any decode error
+        // into a blank state, which would silently discard all review progress.
+        if let saved = try? box.decodeIfPresent(Filter.self, forKey: .filter) {
+            filter = saved
+        } else if let legacyBox = try? decoder.container(keyedBy: LegacyKeys.self),
+                  let legacy = try? legacyBox.decodeIfPresent(LegacyScope.self, forKey: .scope),
+                  case .month(let key) = legacy {
+            filter = Filter(month: key)
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case reviewed, pending, sort, filter, allowsCellular
+    }
+
+    /// Read-only; `scope` was replaced by `filter`. Kept in its own key set so it
+    /// doesn't break the synthesized encoder, which requires every CodingKeys
+    /// case to match a stored property.
+    private enum LegacyKeys: String, CodingKey {
+        case scope
     }
 
     private static var fileURL: URL {

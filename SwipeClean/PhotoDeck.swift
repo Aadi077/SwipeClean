@@ -24,6 +24,23 @@ struct MonthBucket: Identifiable {
     var isFinished: Bool { remaining == 0 }
 }
 
+/// Collection-derived facts about the library, gathered off the main actor.
+struct LibraryIndex {
+    var albumMembers: [String: Set<String>] = [:]
+    var albumTitles: [String: String] = [:]
+    var selfieIDs: Set<String> = []
+}
+
+struct CountBucket: Identifiable {
+    let id: String
+    let title: String
+    let symbol: String?
+    let total: Int
+    let remaining: Int
+
+    var isFinished: Bool { total > 0 && remaining == 0 }
+}
+
 struct YearGroup: Identifiable {
     let year: Int
     let buckets: [MonthBucket]
@@ -58,12 +75,19 @@ final class PhotoDeck {
     private(set) var isLoading = false
     private(set) var sortOrder: SortOrder = .newest
     private(set) var allowsCellular = false
-    private(set) var scope: Scope = .all
+    private(set) var filter = Filter()
     private(set) var months: [MonthBucket] = []
+    private(set) var categoryBuckets: [CountBucket] = []
+    private(set) var albumBuckets: [CountBucket] = []
 
     /// The whole library, kept in memory so changing month or scope is a filter
     /// rather than a refetch.
     private var allAssets: [PHAsset] = []
+    private var assetsByID: [String: PHAsset] = [:]
+    /// localIdentifier sets per album, and the ids PhotoKit considers selfies.
+    private var albumMembers: [String: Set<String>] = [:]
+    private var albumTitles: [String: String] = [:]
+    private var selfieIDs: Set<String> = []
     private var state = ReviewState()
     private var history: [Move] = []
     private var saveTask: Task<Void, Never>?
@@ -81,7 +105,16 @@ final class PhotoDeck {
     var remaining: Int { max(0, queue.count - cursor) }
     var canUndo: Bool { !history.isEmpty }
     var sessionProgress: Double { queue.isEmpty ? 1 : Double(cursor) / Double(queue.count) }
-    var isScoped: Bool { scope != .all }
+    var isFiltered: Bool { !filter.isDefault }
+
+    /// "Screenshots · Sept 2024", or nil when nothing is narrowed.
+    var filterSummary: String? {
+        var parts: [String] = []
+        if filter.category != .all { parts.append(filter.category.label) }
+        if let albumID = filter.albumID { parts.append(albumTitles[albumID] ?? "Album") }
+        if let month = filter.month { parts.append(month.title) }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
 
     var monthsByYear: [YearGroup] {
         var order: [Int] = []
@@ -104,7 +137,7 @@ final class PhotoDeck {
         guard phase == .loading, !isLoading else { return }
         state = ReviewState.load()
         sortOrder = state.sort
-        scope = state.scope
+        filter = state.filter
         allowsCellular = state.allowsCellular
         ImageStore.shared.allowsCellular = allowsCellular
 
@@ -126,6 +159,9 @@ final class PhotoDeck {
         let all = await Task.detached(priority: .userInitiated) {
             PhotoDeck.fetchAssets(order: order)
         }.value
+        let index = await Task.detached(priority: .userInitiated) {
+            PhotoDeck.fetchIndex()
+        }.value
 
         // Forget ids for photos that no longer exist so the file doesn't grow forever.
         let liveIDs = Set(all.map(\.localIdentifier))
@@ -133,11 +169,21 @@ final class PhotoDeck {
         state.pending.formIntersection(liveIDs)
 
         allAssets = all
+        assetsByID = Dictionary(all.map { ($0.localIdentifier, $0) }, uniquingKeysWith: { first, _ in first })
+        albumMembers = index.albumMembers
+        albumTitles = index.albumTitles
+        selfieIDs = index.selfieIDs
         libraryCount = all.count
         pending = all.filter { state.pending.contains($0.localIdentifier) }
 
+        // An album that vanished shouldn't leave the deck stuck showing nothing.
+        if let albumID = filter.albumID, albumMembers[albumID] == nil {
+            filter.albumID = nil
+            state.filter = filter
+        }
+
         rebuildQueue()
-        recomputeMonths()
+        recomputeBuckets()
         saveNow()
         recomputePendingBytes()
     }
@@ -154,45 +200,113 @@ final class PhotoDeck {
         return order == .shuffled ? assets.shuffled() : assets
     }
 
-    /// The queue is always "unreviewed photos inside the current scope". Any
-    /// position from a previous queue is meaningless, so start at the top and
-    /// drop the undo stack.
+    /// Album membership and the selfie list, which are collection lookups rather
+    /// than asset properties. Done once per reload, off the main actor.
+    private nonisolated static func fetchIndex() -> LibraryIndex {
+        var index = LibraryIndex()
+
+        let albums = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .any, options: nil)
+        albums.enumerateObjects { collection, _, _ in
+            let contents = PHAsset.fetchAssets(in: collection, options: nil)
+            guard contents.count > 0 else { return }
+            var ids = Set<String>()
+            ids.reserveCapacity(contents.count)
+            contents.enumerateObjects { asset, _, _ in ids.insert(asset.localIdentifier) }
+            index.albumMembers[collection.localIdentifier] = ids
+            index.albumTitles[collection.localIdentifier] = collection.localizedTitle ?? "Untitled album"
+        }
+
+        let selfies = PHAssetCollection.fetchAssetCollections(with: .smartAlbum,
+                                                             subtype: .smartAlbumSelfPortraits,
+                                                             options: nil)
+        selfies.enumerateObjects { collection, _, _ in
+            PHAsset.fetchAssets(in: collection, options: nil).enumerateObjects { asset, _, _ in
+                index.selfieIDs.insert(asset.localIdentifier)
+            }
+        }
+
+        return index
+    }
+
+    /// The queue is always "unreviewed photos matching the filter". Any position
+    /// from a previous queue is meaningless, so start at the top and drop undo.
     private func rebuildQueue() {
         queue = allAssets.filter { asset in
-            !state.reviewed.contains(asset.localIdentifier) && matchesScope(asset)
+            !state.reviewed.contains(asset.localIdentifier) && matches(asset, filter)
         }
         cursor = 0
         history.removeAll()
     }
 
-    private func matchesScope(_ asset: PHAsset) -> Bool {
-        switch scope {
-        case .all:
-            return true
-        case .month(let key):
-            return MonthKey(for: asset.creationDate) == key
+    private func matches(_ asset: PHAsset, _ candidate: Filter) -> Bool {
+        if let month = candidate.month, MonthKey(for: asset.creationDate) != month { return false }
+        if let albumID = candidate.albumID,
+           albumMembers[albumID]?.contains(asset.localIdentifier) != true { return false }
+        return matchesCategory(asset, candidate.category)
+    }
+
+    private func matchesCategory(_ asset: PHAsset, _ category: Category) -> Bool {
+        switch category {
+        case .all: return true
+        case .screenshots: return asset.mediaSubtypes.contains(.photoScreenshot)
+        case .videos: return asset.mediaType == .video
+        case .selfies: return selfieIDs.contains(asset.localIdentifier)
+        case .livePhotos: return asset.mediaSubtypes.contains(.photoLive)
+        case .favorites: return asset.isFavorite
         }
     }
 
-    // MARK: - Months
+    // MARK: - Counts
 
-    private func recomputeMonths() {
-        var totals: [MonthKey: (total: Int, remaining: Int)] = [:]
+    /// Facet counts: each axis is counted with *itself* relaxed but the other
+    /// axes applied, so the month list shows how many screenshots each month
+    /// holds once Screenshots is picked.
+    private func recomputeBuckets() {
+        var monthTotals: [MonthKey: (total: Int, remaining: Int)] = [:]
+        var categoryTotals: [Category: (total: Int, remaining: Int)] = [:]
+        var albumTotals: [String: (total: Int, remaining: Int)] = [:]
         var unreviewed = 0
 
+        var withoutMonth = filter; withoutMonth.month = nil
+        var withoutCategory = filter; withoutCategory.category = .all
+        var withoutAlbum = filter; withoutAlbum.albumID = nil
+
         for asset in allAssets {
-            let key = MonthKey(for: asset.creationDate)
-            var entry = totals[key] ?? (total: 0, remaining: 0)
-            entry.total += 1
-            if !state.reviewed.contains(asset.localIdentifier) {
-                entry.remaining += 1
-                unreviewed += 1
+            let fresh = !state.reviewed.contains(asset.localIdentifier)
+            if fresh { unreviewed += 1 }
+
+            if matches(asset, withoutMonth) {
+                let key = MonthKey(for: asset.creationDate)
+                var entry = monthTotals[key] ?? (total: 0, remaining: 0)
+                entry.total += 1
+                if fresh { entry.remaining += 1 }
+                monthTotals[key] = entry
             }
-            totals[key] = entry
+
+            if matches(asset, withoutCategory) {
+                for category in Category.allCases where matchesCategory(asset, category) {
+                    var entry = categoryTotals[category] ?? (total: 0, remaining: 0)
+                    entry.total += 1
+                    if fresh { entry.remaining += 1 }
+                    categoryTotals[category] = entry
+                }
+            }
+        }
+
+        // Walk membership sets rather than assets × albums.
+        for (albumID, members) in albumMembers {
+            var entry = (total: 0, remaining: 0)
+            for memberID in members {
+                guard let asset = assetsByID[memberID], matches(asset, withoutAlbum) else { continue }
+                entry.total += 1
+                if !state.reviewed.contains(memberID) { entry.remaining += 1 }
+            }
+            if entry.total > 0 { albumTotals[albumID] = entry }
         }
 
         unreviewedTotal = unreviewed
-        months = totals
+
+        months = monthTotals
             .map { MonthBucket(key: $0.key, total: $0.value.total, remaining: $0.value.remaining) }
             .sorted { a, b in
                 // Undated last, then newest month first.
@@ -200,20 +314,51 @@ final class PhotoDeck {
                 if a.key.year != b.key.year { return a.key.year > b.key.year }
                 return a.key.month > b.key.month
             }
+
+        categoryBuckets = Category.allCases.compactMap { category in
+            guard let entry = categoryTotals[category], entry.total > 0 else { return nil }
+            return CountBucket(id: category.rawValue, title: category.label, symbol: category.symbol,
+                               total: entry.total, remaining: entry.remaining)
+        }
+
+        albumBuckets = albumTotals
+            .map { CountBucket(id: $0.key, title: albumTitles[$0.key] ?? "Album",
+                               symbol: "rectangle.stack", total: $0.value.total, remaining: $0.value.remaining) }
+            .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
     }
 
-    /// Counts drift as you swipe; the month sheet calls this when it opens.
-    func refreshMonths() {
-        recomputeMonths()
+    /// Counts drift as you swipe; the filter sheet calls this when it opens.
+    func refreshCounts() {
+        recomputeBuckets()
     }
 
-    func setScope(_ newScope: Scope) {
-        guard newScope != scope else { return }
-        scope = newScope
-        state.scope = newScope
+    func setFilter(_ newFilter: Filter) {
+        guard newFilter != filter else { return }
+        filter = newFilter
+        state.filter = newFilter
         rebuildQueue()
-        recomputeMonths()
+        recomputeBuckets()
         saveNow()
+    }
+
+    func clearFilter() { setFilter(Filter()) }
+
+    func setCategory(_ category: Category) {
+        var next = filter
+        next.category = category
+        setFilter(next)
+    }
+
+    func setMonth(_ month: MonthKey?) {
+        var next = filter
+        next.month = (filter.month == month) ? nil : month
+        setFilter(next)
+    }
+
+    func setAlbum(_ albumID: String?) {
+        var next = filter
+        next.albumID = (filter.albumID == albumID) ? nil : albumID
+        setFilter(next)
     }
 
     // MARK: - Swiping
@@ -301,20 +446,20 @@ final class PhotoDeck {
         // Deleted assets are still sitting behind the cursor in `queue`; undoing
         // back onto one would show a photo that no longer exists.
         history.removeAll()
-        recomputeMonths()
+        recomputeBuckets()
         saveNow()
     }
 
     /// Clears progress for whatever is currently in scope — the month you're
     /// looking at, or the whole library when nothing is scoped.
     func resetProgress() async {
-        let targetIDs = Set(allAssets.filter { matchesScope($0) }.map(\.localIdentifier))
+        let targetIDs = Set(allAssets.filter { matches($0, filter) }.map(\.localIdentifier))
         state.reviewed.subtract(targetIDs)
         state.pending.subtract(targetIDs)
         pending.removeAll { targetIDs.contains($0.localIdentifier) }
 
         rebuildQueue()
-        recomputeMonths()
+        recomputeBuckets()
         recomputePendingBytes()
         saveNow()
     }
