@@ -81,6 +81,8 @@ final class PhotoDeck {
     private(set) var libraryCount: Int = 0
     private(set) var unreviewedTotal: Int = 0
     private(set) var skippedCount: Int = 0
+    /// Non-nil while the background size measurement is running.
+    private(set) var sizingProgress: (done: Int, total: Int)?
     private(set) var isLimitedAccess = false
     private(set) var isLoading = false
     private(set) var sortOrder: SortOrder = .newest
@@ -101,6 +103,7 @@ final class PhotoDeck {
     private var state = ReviewState()
     private var history: [Move] = []
     private var saveTask: Task<Void, Never>?
+    private var sizingTask: Task<Void, Never>?
 
     // MARK: - Derived
 
@@ -178,6 +181,8 @@ final class PhotoDeck {
         let liveIDs = Set(all.map(\.localIdentifier))
         state.reviewed.formIntersection(liveIDs)
         state.pending.formIntersection(liveIDs)
+        state.skipped.formIntersection(liveIDs)
+        SizeIndex.shared.prune(to: liveIDs)
 
         allAssets = all
         assetsByID = Dictionary(all.map { ($0.localIdentifier, $0) }, uniquingKeysWith: { first, _ in first })
@@ -197,6 +202,7 @@ final class PhotoDeck {
         recomputeBuckets()
         saveNow()
         recomputePendingBytes()
+        ensureSizesIndexed()
     }
 
     private nonisolated static func fetchAssets(order: SortOrder) -> [PHAsset] {
@@ -245,8 +251,68 @@ final class PhotoDeck {
         queue = allAssets.filter { asset in
             !state.reviewed.contains(asset.localIdentifier) && matches(asset, filter)
         }
+        if sortOrder == .largest {
+            queue.sort { bytes(of: $0) > bytes(of: $1) }
+        }
         cursor = 0
         history.removeAll()
+    }
+
+    private func bytes(of asset: PHAsset) -> Int64 {
+        SizeIndex.shared.size(for: asset.localIdentifier) ?? 0
+    }
+
+    /// Re-sorts only the part of the queue still ahead of the cursor. Sorting
+    /// the whole array would pull already-reviewed photos back in front of it.
+    private func resortRemaining() {
+        guard sortOrder == .largest, cursor < queue.count else { return }
+        let head = Array(queue[..<cursor])
+        let tail = Array(queue[cursor...]).sorted { bytes(of: $0) > bytes(of: $1) }
+        queue = head + tail
+    }
+
+    /// Measures anything unmeasured, in the background, then re-sorts. The deck
+    /// stays usable in its existing order while this runs.
+    func ensureSizesIndexed() {
+        guard sortOrder == .largest, sizingTask == nil else { return }
+
+        let missing = Set(SizeIndex.shared.missingIDs(among: allAssets.map(\.localIdentifier)))
+        let todo = allAssets.filter { missing.contains($0.localIdentifier) }
+        guard !todo.isEmpty else {
+            resortRemaining()
+            return
+        }
+
+        sizingProgress = (done: 0, total: todo.count)
+        sizingTask = Task.detached(priority: .utility) { [weak self] in
+            var batch: [String: Int64] = [:]
+            var done = 0
+
+            for asset in todo {
+                if Task.isCancelled { break }
+                batch[asset.localIdentifier] = AssetSize.bytes(of: asset)
+                done += 1
+
+                if batch.count >= 50 {
+                    SizeIndex.shared.merge(batch)
+                    batch.removeAll(keepingCapacity: true)
+                    let sofar = done
+                    let outOf = todo.count
+                    await MainActor.run { [weak self] in
+                        self?.sizingProgress = (done: sofar, total: outOf)
+                    }
+                }
+            }
+
+            SizeIndex.shared.merge(batch)
+            SizeIndex.shared.save()
+
+            await MainActor.run { [weak self] in
+                self?.sizingProgress = nil
+                self?.sizingTask = nil
+                self?.resortRemaining()
+            }
+        }
     }
 
     private func matches(_ asset: PHAsset, _ candidate: Filter, ignoringSkipAxis: Bool = false) -> Bool {
@@ -388,9 +454,14 @@ final class PhotoDeck {
         if delete {
             state.pending.insert(asset.localIdentifier)
             pending.append(asset)
-            Task.detached(priority: .utility) {
-                let size = AssetSize.bytes(of: asset)
-                await MainActor.run { self.pendingBytes += size }
+            if let known = SizeIndex.shared.size(for: asset.localIdentifier) {
+                pendingBytes += known
+            } else {
+                Task.detached(priority: .utility) {
+                    let size = AssetSize.bytes(of: asset)
+                    SizeIndex.shared.merge([asset.localIdentifier: size])
+                    await MainActor.run { self.pendingBytes += size }
+                }
             }
         }
 
@@ -467,10 +538,18 @@ final class PhotoDeck {
 
     func setSort(_ order: SortOrder) {
         guard order != sortOrder else { return }
+        if order != .largest {
+            sizingTask?.cancel()
+            sizingTask = nil
+            sizingProgress = nil
+        }
         sortOrder = order
         state.sort = order
         saveNow()
-        Task { await reload() }
+        Task {
+            await reload()
+            ensureSizesIndexed()
+        }
     }
 
     // MARK: - Deleting for real
@@ -524,8 +603,22 @@ final class PhotoDeck {
     private func recomputePendingBytes() {
         let targets = pending
         Task.detached(priority: .utility) {
-            let total = targets.reduce(Int64(0)) { $0 + AssetSize.bytes(of: $1) }
-            await MainActor.run { self.pendingBytes = total }
+            var total: Int64 = 0
+            var measured: [String: Int64] = [:]
+
+            for asset in targets {
+                if let known = SizeIndex.shared.size(for: asset.localIdentifier) {
+                    total += known
+                } else {
+                    let size = AssetSize.bytes(of: asset)
+                    measured[asset.localIdentifier] = size
+                    total += size
+                }
+            }
+
+            SizeIndex.shared.merge(measured)
+            let settled = total
+            await MainActor.run { self.pendingBytes = settled }
         }
     }
 

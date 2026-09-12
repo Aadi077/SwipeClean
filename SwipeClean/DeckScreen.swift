@@ -49,6 +49,16 @@ struct DeckScreen: View {
 
             ProgressView(value: deck.sessionProgress)
                 .tint(Color.keepGreen)
+
+            if let sizing = deck.sizingProgress {
+                HStack(spacing: 7) {
+                    ProgressView().controlSize(.mini)
+                    Text("Measuring sizes — \(sizing.done) of \(sizing.total)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+            }
         }
         .padding(.horizontal, 20)
         .padding(.top, 6)

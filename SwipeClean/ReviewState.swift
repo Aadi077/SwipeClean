@@ -3,6 +3,7 @@ import Foundation
 enum SortOrder: String, Codable, CaseIterable, Identifiable {
     case newest
     case oldest
+    case largest
     case shuffled
 
     var id: String { rawValue }
@@ -11,6 +12,7 @@ enum SortOrder: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .newest: return "Newest first"
         case .oldest: return "Oldest first"
+        case .largest: return "Biggest first"
         case .shuffled: return "Shuffled"
         }
     }
@@ -19,6 +21,7 @@ enum SortOrder: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .newest: return "arrow.down.to.line"
         case .oldest: return "arrow.up.to.line"
+        case .largest: return "externaldrive"
         case .shuffled: return "shuffle"
         }
     }

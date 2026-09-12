@@ -112,7 +112,11 @@ final class ImageStore: @unchecked Sendable {
         manager.startCachingImages(for: assets, targetSize: size, contentMode: .aspectFit, options: options)
     }
 
+    /// Card captions go through here, which quietly warms the shared index.
     func byteSize(of asset: PHAsset) async -> Int64 {
-        await Task.detached(priority: .utility) { AssetSize.bytes(of: asset) }.value
+        if let known = SizeIndex.shared.size(for: asset.localIdentifier) { return known }
+        let bytes = await Task.detached(priority: .utility) { AssetSize.bytes(of: asset) }.value
+        SizeIndex.shared.merge([asset.localIdentifier: bytes])
+        return bytes
     }
 }
