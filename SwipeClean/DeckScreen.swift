@@ -186,6 +186,10 @@ struct DeckScreen: View {
             stamp(text: "DELETE", color: .deleteRed, angle: 14)
                 .opacity(Double(max(0, -offset.width) / threshold))
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            stamp(text: "SKIP", color: .skipGrey, angle: 0)
+                .opacity(Double(max(0, -offset.height) / threshold))
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .padding(.bottom, 54)
         }
         .padding(22)
         .allowsHitTesting(false)
@@ -207,18 +211,23 @@ struct DeckScreen: View {
     // MARK: - Controls
 
     private var controls: some View {
-        HStack(spacing: 26) {
+        HStack(spacing: 18) {
             roundButton(symbol: "trash.fill", color: .deleteRed, diameter: 66) {
-                fling(delete: true)
+                commit(.bin)
             }
             .disabled(deck.current == nil || locked)
 
-            roundButton(symbol: "arrow.uturn.backward", color: .white.opacity(0.55), diameter: 50, action: undo)
+            roundButton(symbol: "arrow.uturn.backward", color: .white.opacity(0.55), diameter: 46, action: undo)
                 .disabled(!deck.canUndo || locked)
                 .opacity(deck.canUndo ? 1 : 0.3)
 
+            roundButton(symbol: "arrow.up", color: .skipGrey, diameter: 46) {
+                commit(.skip)
+            }
+            .disabled(deck.current == nil || locked)
+
             roundButton(symbol: "checkmark", color: .keepGreen, diameter: 66) {
-                fling(delete: false)
+                commit(.keep)
             }
             .disabled(deck.current == nil || locked)
         }
@@ -249,29 +258,44 @@ struct DeckScreen: View {
             }
             .onEnded { value in
                 guard !locked else { return }
-                let projected = value.translation.width + value.predictedEndTranslation.width * 0.35
-                if projected > threshold {
-                    fling(delete: false)
-                } else if projected < -threshold {
-                    fling(delete: true)
+                let across = value.translation.width + value.predictedEndTranslation.width * 0.35
+                let up = value.translation.height + value.predictedEndTranslation.height * 0.35
+
+                // Upward only wins when it clearly dominates, so a normal
+                // left/right flick that drifts a little never reads as a skip.
+                if up < -threshold, abs(up) > abs(across) {
+                    commit(.skip)
+                } else if across > threshold {
+                    commit(.keep)
+                } else if across < -threshold {
+                    commit(.bin)
                 } else {
                     withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) { offset = .zero }
                 }
             }
     }
 
-    private func fling(delete: Bool) {
+    private func commit(_ verdict: PhotoDeck.Verdict) {
         guard !locked, deck.current != nil else { return }
         locked = true
         UIImpactFeedbackGenerator(style: .soft).impactOccurred()
 
-        withAnimation(.easeOut(duration: 0.26)) {
-            offset = CGSize(width: delete ? -800 : 800, height: offset.height + 60)
+        let target: CGSize
+        switch verdict {
+        case .keep: target = CGSize(width: 800, height: offset.height + 60)
+        case .bin: target = CGSize(width: -800, height: offset.height + 60)
+        case .skip: target = CGSize(width: offset.width, height: -1000)
         }
+
+        withAnimation(.easeOut(duration: 0.26)) { offset = target }
 
         Task {
             try? await Task.sleep(nanoseconds: 260_000_000)
-            deck.decide(delete: delete)
+            switch verdict {
+            case .keep: deck.decide(delete: false)
+            case .bin: deck.decide(delete: true)
+            case .skip: deck.skip()
+            }
             offset = .zero
             locked = false
         }
@@ -313,6 +337,12 @@ struct DoneCard: View {
                     .buttonStyle(.borderedProminent)
                     .tint(Color.deleteRed)
             }
+            if deck.skippedCount > 0 && !deck.filter.skippedOnly {
+                Button("Review \(deck.skippedCount) skipped") { deck.toggleSkippedOnly() }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Color.skipGrey)
+            }
+
             Button(deck.isFiltered ? "Change filter" : "Filter photos") {
                 showFilters = true
             }

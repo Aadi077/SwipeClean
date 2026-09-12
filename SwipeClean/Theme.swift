@@ -3,6 +3,7 @@ import SwiftUI
 extension Color {
     static let keepGreen = Color(red: 0.22, green: 0.84, blue: 0.52)
     static let deleteRed = Color(red: 1.00, green: 0.29, blue: 0.36)
+    static let skipGrey = Color(white: 0.72)
     static let cardSurface = Color(white: 0.13)
     static let appBackground = Color(white: 0.05)
 }

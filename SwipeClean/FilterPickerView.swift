@@ -22,6 +22,17 @@ struct FilterPickerView: View {
                             deck.clearFilter()
                             dismiss()
                         }
+                        if deck.skippedCount > 0 {
+                            FilterRow(
+                                title: "Skipped",
+                                symbol: "arrow.up.circle",
+                                total: deck.skippedCount,
+                                remaining: deck.skippedCount,
+                                isSelected: deck.filter.skippedOnly
+                            ) {
+                                deck.toggleSkippedOnly()
+                            }
+                        }
                     } footer: {
                         if deck.isFiltered, let summary = deck.filterSummary {
                             Text("Showing \(summary). Filters stack — pick a type and a month to combine them.")

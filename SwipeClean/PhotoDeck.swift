@@ -59,9 +59,18 @@ final class PhotoDeck {
         case ready
     }
 
+    enum Verdict {
+        case keep
+        case bin
+        case skip
+    }
+
     private struct Move {
         let asset: PHAsset
-        let delete: Bool
+        let verdict: Verdict
+        /// Whether the photo had been deferred before this move, so undo can
+        /// put it back in the skip pile rather than the main queue.
+        let wasSkipped: Bool
     }
 
     private(set) var phase: Phase = .loading
@@ -71,6 +80,7 @@ final class PhotoDeck {
     private(set) var pendingBytes: Int64 = 0
     private(set) var libraryCount: Int = 0
     private(set) var unreviewedTotal: Int = 0
+    private(set) var skippedCount: Int = 0
     private(set) var isLimitedAccess = false
     private(set) var isLoading = false
     private(set) var sortOrder: SortOrder = .newest
@@ -110,6 +120,7 @@ final class PhotoDeck {
     /// "Screenshots · Sept 2024", or nil when nothing is narrowed.
     var filterSummary: String? {
         var parts: [String] = []
+        if filter.skippedOnly { parts.append("Skipped") }
         if filter.category != .all { parts.append(filter.category.label) }
         if let albumID = filter.albumID { parts.append(albumTitles[albumID] ?? "Album") }
         if let month = filter.month { parts.append(month.title) }
@@ -238,7 +249,11 @@ final class PhotoDeck {
         history.removeAll()
     }
 
-    private func matches(_ asset: PHAsset, _ candidate: Filter) -> Bool {
+    private func matches(_ asset: PHAsset, _ candidate: Filter, ignoringSkipAxis: Bool = false) -> Bool {
+        // The deferred pile is a mode, not a slice: normal browsing hides it,
+        // and skippedOnly shows nothing else.
+        if !ignoringSkipAxis,
+           state.skipped.contains(asset.localIdentifier) != candidate.skippedOnly { return false }
         if let month = candidate.month, MonthKey(for: asset.creationDate) != month { return false }
         if let albumID = candidate.albumID,
            albumMembers[albumID]?.contains(asset.localIdentifier) != true { return false }
@@ -273,6 +288,7 @@ final class PhotoDeck {
 
         for asset in allAssets {
             let fresh = !state.reviewed.contains(asset.localIdentifier)
+                && !state.skipped.contains(asset.localIdentifier)
             if fresh { unreviewed += 1 }
 
             if matches(asset, withoutMonth) {
@@ -305,6 +321,7 @@ final class PhotoDeck {
         }
 
         unreviewedTotal = unreviewed
+        skippedCount = state.skipped.count
 
         months = monthTotals
             .map { MonthBucket(key: $0.key, total: $0.value.total, remaining: $0.value.remaining) }
@@ -366,6 +383,7 @@ final class PhotoDeck {
     func decide(delete: Bool) {
         guard let asset = current else { return }
 
+        let wasSkipped = state.skipped.remove(asset.localIdentifier) != nil
         state.reviewed.insert(asset.localIdentifier)
         if delete {
             state.pending.insert(asset.localIdentifier)
@@ -376,29 +394,61 @@ final class PhotoDeck {
             }
         }
 
-        history.append(Move(asset: asset, delete: delete))
+        history.append(Move(asset: asset, verdict: delete ? .bin : .keep, wasSkipped: wasSkipped))
+        if history.count > 200 { history.removeFirst() }
+
+        cursor += 1
+        if !wasSkipped { unreviewedTotal = max(0, unreviewedTotal - 1) }
+        skippedCount = state.skipped.count
+        scheduleSave()
+    }
+
+    /// Defer a photo. It leaves the queue without being judged and waits in the
+    /// skip pile, which survives relaunch.
+    func skip() {
+        guard let asset = current else { return }
+
+        state.skipped.insert(asset.localIdentifier)
+        history.append(Move(asset: asset, verdict: .skip, wasSkipped: false))
         if history.count > 200 { history.removeFirst() }
 
         cursor += 1
         unreviewedTotal = max(0, unreviewedTotal - 1)
+        skippedCount = state.skipped.count
         scheduleSave()
     }
 
     func undo() {
         guard let move = history.popLast() else { return }
+        let id = move.asset.localIdentifier
 
-        state.reviewed.remove(move.asset.localIdentifier)
-        if move.delete {
-            state.pending.remove(move.asset.localIdentifier)
-            pending.removeAll { $0.localIdentifier == move.asset.localIdentifier }
-            recomputePendingBytes()
+        switch move.verdict {
+        case .keep, .bin:
+            state.reviewed.remove(id)
+            if move.verdict == .bin {
+                state.pending.remove(id)
+                pending.removeAll { $0.localIdentifier == id }
+                recomputePendingBytes()
+            }
+            // Restore the pile membership it had before, not a blanket un-skip.
+            if move.wasSkipped { state.skipped.insert(id) } else { unreviewedTotal += 1 }
+        case .skip:
+            state.skipped.remove(id)
+            unreviewedTotal += 1
         }
+
+        skippedCount = state.skipped.count
         cursor = max(0, cursor - 1)
-        unreviewedTotal += 1
         scheduleSave()
     }
 
     /// Pull a photo back out of the bin; it stays reviewed, just kept.
+    func toggleSkippedOnly() {
+        var next = filter
+        next.skippedOnly.toggle()
+        setFilter(next)
+    }
+
     func restore(_ asset: PHAsset) {
         state.pending.remove(asset.localIdentifier)
         pending.removeAll { $0.localIdentifier == asset.localIdentifier }
@@ -453,9 +503,14 @@ final class PhotoDeck {
     /// Clears progress for whatever is currently in scope — the month you're
     /// looking at, or the whole library when nothing is scoped.
     func resetProgress() async {
-        let targetIDs = Set(allAssets.filter { matches($0, filter) }.map(\.localIdentifier))
+        // Starting over clears deferrals too, so the skip axis is ignored when
+        // working out what's in scope — otherwise the pile would survive a reset.
+        let targetIDs = Set(allAssets
+            .filter { matches($0, filter, ignoringSkipAxis: true) }
+            .map(\.localIdentifier))
         state.reviewed.subtract(targetIDs)
         state.pending.subtract(targetIDs)
+        state.skipped.subtract(targetIDs)
         pending.removeAll { targetIDs.contains($0.localIdentifier) }
 
         rebuildQueue()

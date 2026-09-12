@@ -105,13 +105,16 @@ struct Filter: Hashable, Codable {
     var category: Category = .all
     var month: MonthKey? = nil
     var albumID: String? = nil
+    /// Inverts the deck to show only the deferred pile.
+    var skippedOnly = false
 
     var isDefault: Bool { self == Filter() }
 
-    init(category: Category = .all, month: MonthKey? = nil, albumID: String? = nil) {
+    init(category: Category = .all, month: MonthKey? = nil, albumID: String? = nil, skippedOnly: Bool = false) {
         self.category = category
         self.month = month
         self.albumID = albumID
+        self.skippedOnly = skippedOnly
     }
 
     // Lenient like ReviewState: a field added in a later version must not make
@@ -121,6 +124,7 @@ struct Filter: Hashable, Codable {
         category = (try? box.decodeIfPresent(Category.self, forKey: .category) ?? .all) ?? .all
         month = try? box.decodeIfPresent(MonthKey.self, forKey: .month)
         albumID = try? box.decodeIfPresent(String.self, forKey: .albumID)
+        skippedOnly = (try? box.decodeIfPresent(Bool.self, forKey: .skippedOnly) ?? false) ?? false
     }
 }
 
@@ -135,6 +139,8 @@ enum LegacyScope: Hashable, Codable {
 struct ReviewState: Codable {
     var reviewed: Set<String> = []
     var pending: Set<String> = []
+    /// Deferred, not judged — deliberately separate from `reviewed`.
+    var skipped: Set<String> = []
     var sort: SortOrder = .newest
     var filter = Filter()
     var allowsCellular = false
@@ -147,6 +153,7 @@ struct ReviewState: Codable {
         let box = try decoder.container(keyedBy: CodingKeys.self)
         reviewed = try box.decodeIfPresent(Set<String>.self, forKey: .reviewed) ?? []
         pending = try box.decodeIfPresent(Set<String>.self, forKey: .pending) ?? []
+        skipped = try box.decodeIfPresent(Set<String>.self, forKey: .skipped) ?? []
         sort = try box.decodeIfPresent(SortOrder.self, forKey: .sort) ?? .newest
         allowsCellular = try box.decodeIfPresent(Bool.self, forKey: .allowsCellular) ?? false
 
@@ -162,7 +169,7 @@ struct ReviewState: Codable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case reviewed, pending, sort, filter, allowsCellular
+        case reviewed, pending, skipped, sort, filter, allowsCellular
     }
 
     /// Read-only; `scope` was replaced by `filter`. Kept in its own key set so it
